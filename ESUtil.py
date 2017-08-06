@@ -384,53 +384,6 @@ class ESUtil(object):
         logging.info("Successfully imported file {} - total recs: {} total time: {} secs".format(in_file,
                                                                                     loaded_rec_count, total_time()))
         return loaded_rec_count
-    #------------------------------------------------------------------------------------------------------------
-    def get_dashboard(self, name):
-        q = {'query': {'filtered': {
-                'filter': {'term' : {'_id': name}}
-            }}}
-
-        recs = self.recs_scan(index='kibana-int', doc_type='dashboard', body=q)
-        assert len(recs) == 1
-        rec = recs[0]
-
-        s = json.loads(rec['dashboard'])
-        return {'dashboard': s['services'], 'index': s['index']['default'], 'name':name}
-
-    #------------------------------------------------------------------------------------------------------------
-    def make_query_from_dashboard(self, db, from_ts="now-7d"):
-        must_list = []
-        must_not_list = []
-
-        must_list.append({"range": { "@timestamp": {"gte": from_ts}}})
-
-        for k, v in db['dashboard']['filter']['list'].items():
-            if v['type'] == 'time' and v['field'] == '@timestamp':
-                logging.info("Skip time filter: {}".format(v))
-                continue
-            if v['mandate'] == 'must':
-                l = must_list
-            elif v['mandate'] == 'must_not':
-                l = must_not_list
-            else:
-                raise Exception("Unhandled mandate in {}".format(v))
-
-            if v['type'] == 'querystring':
-                l.append({'query': {'query_string': {'query': v['query']}}})
-        b = {}
-        if must_list:
-            b['must'] = must_list
-        if must_not_list:
-            b['must_not'] = must_not_list
-        qd = {'filter': {'bool': b}}
-        return qd
-    #-------------------------------------------------------------------------------------------
-    def load_dashboard(self, name, from_ts='now-7d'):
-        db = self.get_dashboard(name)
-
-        q = self.make_query_from_dashboard(db, from_ts=from_ts)
-        r = self.recs_scan(index=db['index'], doc_type=None, body=q)
-        return r
 
     #-------------------------------------------------------------------------------------------
     def _make_map(self, doc_type, props):
@@ -458,9 +411,9 @@ class ESUtil(object):
 
     #-------------------------------------------------------------------------------------------
     def get_props_from_recs(self, recs, analyzed_fields=None):
+
         if isinstance(recs, dict):
             recs = [recs]
-        #assert isinstance(recs[0], dict), "recs must of dict or list of dict - bad type {}".format(type(recs[0]))
 
         str_props = {'type': 'keyword'}
         date_props = {'type': 'date'}
@@ -468,49 +421,50 @@ class ESUtil(object):
             str: str_props,
             datetime.datetime: date_props,
             datetime.date: date_props,
-            pd.tslib.Timestamp: date_props,
+            pd.Timestamp: date_props,
             int: {'type': 'integer'},
             bool: {'type': 'boolean'},
             float: {'type': 'double'},
             dict: {'type': 'nested', "include_in_root": True},
-
+            'geo_point': {'type': 'geo_point'},
         }
-        #logging.info("Rec: {}".format(rec))
-        if isinstance(recs, dict):
-            rec = [recs]
-        type_dict = {}
+
+        props = {}
         for r in recs:
             for k, v in r.items():
+                if k.startswith('_'):
+                    continue
+
                 if isinstance(v, list) or isinstance(v, tuple):
                     if len(v) == 0:
                         continue
                     type_v = type(v[0])
                 elif v is None:
                     continue
+                elif isinstance(v, dict) and set(v.keys()) == {'lat', 'lon'}:
+                    type_v = 'geo_point'
                 else:
                     type_v = type(v)
 
                 if type_v not in type_map:
                     raise Exception("Invalid type '{}' for field '{}' in rec:\n{}".format(type_v, k,
                                                                                           pprint.pformat(r)))
-                if k in type_dict:
-                    old_type, current_type  = type_dict[k], type_v
-                    if type_map[old_type] != type_map[current_type]:
+                if k in props:
+                    old_type, current_type  = props[k], type_map[type_v]
+                    if old_type != current_type:
                         raise Exception("Type of field '{}' was {} - now {} - incompatible change".format(k,
-                                                                                    type_dict[k], type_v))
+                                                                                    old_type, current_type))
                 else:
-                    type_dict[k] = type_v
+                    props[k] = type_map[type_v]
 
-        # skip nested field mappings....
-        props = {k: type_map[v].copy() for (k, v) in type_dict.items() if k[0] != "_"}
         if analyzed_fields:
             for f in analyzed_fields:
-                assert props[f]['type'] == 'text'
-                props[f]['index'] = 'analyzed'
+                assert props[f]['type'] == 'keyword'
+                props[f]['type'] = 'text'
         return props
 
     # ------------------------------------------------------------------------------------------------------------------
-    def _get_mappings_from_props(self, props):
+    def get_mappings_from_props(self, props):
         return {
             "_default_": {
                 "_all": {
@@ -528,8 +482,14 @@ class ESUtil(object):
             }
         }
 
+
     #-------------------------------------------------------------------------------------------------------------------
-    def create_template(self, template_name, index_pattern, props, settings=None):
+    def get_mappings_from_recs(self, recs, analyzed_fields=None):
+        props = self.get_props_from_recs(recs, analyzed_fields)
+        return self.get_mappings_from_props(props)
+
+    #-------------------------------------------------------------------------------------------------------------------
+    def create_template(self, template_name, index_pattern, mappings, settings=None):
         if settings is None:
             settings = {
                 "number_of_shards": 2,
@@ -539,7 +499,7 @@ class ESUtil(object):
         template_body = {
             "template": index_pattern,
             "settings": settings,
-            "mappings": self._get_mappings_from_props(props),
+            "mappings": mappings,
         }
         logging.info ("Creating Template {}".format (template_name))
         if self._es.indices.exists_template (template_name):
